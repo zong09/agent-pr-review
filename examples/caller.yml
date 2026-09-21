@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   ai-review:
-    uses: OWNER/ai-pr-review/.github/workflows/pr-review.yml@main
+    uses: OWNER/agent-pr-review/.github/workflows/pr-review.yml@v1
     secrets:
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
     # ทุก input มีค่า default หมด — ใส่เฉพาะที่อยากเปลี่ยน
