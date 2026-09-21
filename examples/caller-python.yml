@@ -1,0 +1,35 @@
+# ตัวอย่าง caller สำหรับโปรเจกต์ Python
+# วางที่ .github/workflows/ai-review.yml ใน repo ปลายทาง แล้วแก้ OWNER
+#
+# checklist default จูนมาสำหรับ TypeScript เอามาใช้กับ Python ตรง ๆ จะพลาดของสำคัญ
+# ชุดด้านล่างเป็นจุดตั้งต้น — ควรปรับตามสิ่งที่โปรเจกต์คุณใช้จริง
+# วิธีที่ได้ผลคือสำรวจโค้ดก่อนแล้วเรียงข้อตามความเสี่ยงจริง ไม่ใช่เรียงตามทฤษฎี
+# เช่น ถ้า repo ใช้ raw SQL เยอะให้เอาข้อ SQL ขึ้นก่อน ถ้าแทบไม่มี async ให้ดันข้อ await ลงท้าย
+
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-review:
+    uses: OWNER/agent-pr-review/.github/workflows/pr-review.yml@main
+    secrets:
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    with:
+      extra_instructions: |
+        โปรเจกต์นี้เป็นโค้ด Python
+        ตรวจตามรายการนี้ทีละข้อ รายงานเฉพาะข้อที่พบจริง พร้อมชื่อฟังก์ชันและบรรทัด:
+        (1) SQL ที่ประกอบด้วย f-string หรือการต่อ string แทนการ bind parameter
+        (2) ใช้ float กับจำนวนเงินแทน Decimal รวมถึงแปลง Decimal เป็น float ก่อนคำนวณ
+        (3) หารด้วยค่าที่อาจเป็นศูนย์ เช่น len() ของลิสต์ว่าง
+        (4) except ที่ว่างเปล่าหรือกลืน exception โดยไม่ log และไม่ rethrow
+        (5) mutable default argument เช่น def f(x=[]) หรือ def f(x={})
+        (6) อ่านแล้วเขียน state ร่วมโดยไม่มี transaction หรือ lock ทำให้เกิด race
+        (7) ค่า secret ที่ hardcode ในโค้ดหรือใน config ที่ commit ขึ้น repo
+        (8) เรียก coroutine โดยไม่ใส่ await ก่อนนำผลไปเปรียบเทียบหรือคำนวณ

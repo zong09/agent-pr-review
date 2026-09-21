@@ -1,0 +1,29 @@
+# dogfood — repo นี้รีวิว PR ของตัวเองด้วย workflow ของตัวเอง
+# มีไว้เพื่อให้รู้ทันทีเมื่อแก้ pr-review.yml แล้วพัง ไม่ต้องรอไปพังที่โปรเจกต์อื่น
+
+name: Self Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-review:
+    uses: ./.github/workflows/pr-review.yml
+    secrets:
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    with:
+      # repo นี้มีแต่ YAML กับ bash ไม่ใช่ TypeScript — checklist จึงต้องคนละชุด
+      extra_instructions: |
+        นี่คือ repo ที่มีแต่ GitHub Actions workflow และ bash script
+        ตรวจตามรายการนี้ทีละข้อ และรายงานเฉพาะข้อที่พบจริงพร้อมชื่อไฟล์และบรรทัด:
+        (1) ค่าจาก github.event หรือ inputs ที่ถูกแทรกเข้า run: ด้วย expression โดยตรง
+            แทนที่จะส่งผ่าน env — เสี่ยง script injection
+        (2) command substitution ใน bash ที่มี set -e แล้วไม่ดัก exit code ทำให้ error message ไม่ถูกพิมพ์
+        (3) step ที่ไม่มี timeout-minutes ทั้งที่รอ network ได้นาน
+        (4) secret ที่หลุดไปอยู่ใน log หรือใน command line
+        (5) ผลรวม timeout ของ step ที่เกิน timeout ของ job

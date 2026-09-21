@@ -1,0 +1,33 @@
+# วางไฟล์นี้ที่ .github/workflows/ai-review.yml ในโปรเจกต์ที่อยากให้รีวิว
+# แล้วเปลี่ยน OWNER เป็น GitHub username/org ของคุณ
+#
+# ต้องตั้ง secret ชื่อ DASHSCOPE_API_KEY ไว้ที่ repo หรือที่ org (Settings > Secrets > Actions)
+
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-review:
+    uses: OWNER/ai-pr-review/.github/workflows/pr-review.yml@main
+    secrets:
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    # ทุก input มีค่า default หมด — ใส่เฉพาะที่อยากเปลี่ยน
+    # with:
+    #   model: dashscope/qwen3-max
+    #   run_improve: false          # ปิดถ้าอยากประหยัด GitHub minutes
+    #   ai_timeout: 300
+    #
+    #   # ⚠️ default จูนมาสำหรับ TypeScript — โปรเจกต์ภาษาอื่นควรเขียนเอง
+    #   #    ไม่ต้องใส่บรรทัด SECURITY_STATUS เอง workflow ต่อท้ายให้เสมอ
+    #   extra_instructions: |
+    #     ตรวจตามรายการนี้ทีละข้อ และรายงานเฉพาะข้อที่พบจริงพร้อมชื่อฟังก์ชันและบรรทัด:
+    #     (1) error ที่ถูกกลืนโดยไม่ log และไม่ return
+    #     (2) SQL ที่ประกอบจาก input ของผู้ใช้
+    #     (3) goroutine ที่ไม่มีทางจบ

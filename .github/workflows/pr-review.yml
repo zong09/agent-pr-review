@@ -1,0 +1,317 @@
+# AI PR Review — reusable workflow (personal edition)
+#
+# หลักการออกแบบสามข้อ:
+#   1. รันบน ubuntu-latest — ไม่ต้องมี self-hosted runner ของตัวเอง
+#   2. pr-agent ยิง QwenCloud ตรง — ไม่มี LiteLLM proxy คั่นกลาง
+#      (LiteLLM ยังอยู่ แต่ในฐานะ library ข้างใน pr-agent ไม่ใช่ service ที่ต้องเลี้ยง)
+#   3. config ส่งผ่าน env + CLI ล้วน — ไม่เขียน .secrets.toml ลงดิสก์
+#      จึงไม่ต้องมี backup/restore/cleanup และไม่มีคีย์ตกค้างบนดิสก์ของ runner
+#
+# ⚠️ ถ้าเปลี่ยน model หรือเปลี่ยน provider ผลวัดทุกตัวในไฟล์นี้เป็นโมฆะ
+#    เพราะตัวเลขพวกนี้ผูกกับ model + provider + ภาษาของโค้ด แยกจากกันไม่ได้
+#    รัน scripts/compare-models.sh ใหม่ก่อนไว้ใจ Gate เสมอ
+
+name: AI PR Review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: >-
+          LiteLLM model id (ต้องมี prefix dashscope/)
+          ⚠️ model ที่ใช้ได้ขึ้นกับชนิดคีย์ — qwen3-coder-plus คืน 404 "Model not exist"
+          บน Token Plan ทั้งที่ litellm รู้จักมัน อย่าเลือกจาก price map ของ litellm อย่างเดียว
+        type: string
+        # วัดจริง 2026-09-21 · scripts/compare-models.sh · diff 38KB · 5 รอบต่อ model
+        # บน Token Plan (token-plan.maas.qwencloudapi.com):
+        #   qwen3.8-max      latency 76-128s  median 116s · SECURITY_STATUS 5/5  <- เลือกตัวนี้
+        #   qwen3.8-flash    latency 41-189s  median 128s · SECURITY_STATUS 5/5
+        #   qwen3-coder-plus 404 Model not exist (ไม่มีใน Token Plan)
+        #
+        # ราคา: flash $0.15/$0.47 ต่อ M · max $2.00/$6.00 ต่อ M = max แพงกว่า ~13 เท่า
+        #   ตีเป็นต่อ PR (รวม improve): flash ~$0.02 · max ~$0.25
+        #   ที่ 40 PR/เดือน = $0.80 vs $10 — บน Token Plan ก็คือ credit หมดเร็วกว่า 13 เท่า
+        #
+        # เลือก flash เพราะ "ราคา" ไม่ใช่เพราะเร็วกว่า — ข้อมูล latency เข้าทาง max ด้วยซ้ำ
+        #   (max median ต่ำกว่า และแกว่งแค่ 1.7 เท่า เทียบกับ flash 4.6 เท่า)
+        #   สิ่งที่แลกไปคือความแน่นอน จึงชดเชยด้วย ai_timeout ที่สูงขึ้นเป็น 480
+        #   ถ้าวันหนึ่งงบไม่ใช่ข้อจำกัดแล้ว max คือตัวเลือกที่ดีกว่าในเชิงเทคนิค
+        #
+        # อัตราการจับบั๊กจริง (2026-09-21 · PR ทดสอบที่ฝังบั๊กไว้ 5 ข้อ · flash):
+        #   จับได้ 5/5 — script injection, command substitution คู่กับ set -e,
+        #   step ไม่มี timeout, secret ลง log, step timeout เกิน job timeout
+        #   ระบุเลขบรรทัดถูกทุกข้อ และออก SECURITY_STATUS: FINDINGS ถูกรูปแบบ
+        #   ข้อกังวลว่า flash เป็น tier ที่อ่อนกว่าจึงยังไม่ปรากฏเป็นปัญหาจริง
+        #
+        #   ⚠️ n=1 เท่านั้น — วัดรอบเดียวบน diff เดียว ยังสรุปความสม่ำเสมอไม่ได้
+        #   ควรรันอย่างน้อย 5 รอบเพื่อดูว่าจับได้สม่ำเสมอ ไม่ใช่จับได้บางรอบ
+        #   ถ้าจะไว้ใจเป็นตัวเลข ต้องเปิด PR ซ้ำด้วย diff ชุดเดียวกันหลายรอบ
+        default: dashscope/qwen3.8-flash
+      api_base:
+        description: >-
+          ปล่อยว่างไว้ = เดาจาก prefix ของคีย์ให้อัตโนมัติ (แนะนำ)
+          ใส่เองเฉพาะเมื่อใช้ provider อื่น เช่น Alibaba Cloud Model Studio
+          ⚠️ QwenCloud ผูกคีย์กับ base URL แบบสลับกันไม่ได้ ใส่ผิด = 401 invalid_api_key
+          ซึ่งอ่านแล้วนึกว่าคีย์เสีย ทั้งที่คีย์ถูกทุกตัวอักษร
+        type: string
+        default: ""
+      ai_timeout:
+        description: >-
+          วินาทีต่อ 1 request — ดูคำเตือนเรื่องตัวคูณ 6 ที่ step Review
+          480 มาจาก flash ที่วัดได้ช้าสุด 189s × 2.5 เผื่อ prompt จริงที่ยาวกว่า
+          (ถ้าเปลี่ยนไปใช้ max ลดเหลือ 300 ได้ เพราะแกว่งน้อยกว่ามาก)
+        type: number
+        default: 480
+      custom_model_max_tokens:
+        description: context window ที่บอก pr-agent (จำเป็นเมื่อ model ไม่อยู่ใน price map ของ litellm)
+        type: number
+        default: 40000
+      pr_agent_version:
+        description: >-
+          ปักหมุดเวอร์ชันไว้ ไม่ปักแล้ววันหนึ่ง upstream เปลี่ยนพฤติกรรม
+          Gate จะเพี้ยนโดยไม่มีใครรู้ตัว
+        type: string
+        default: "0.44.0"
+      run_improve:
+        description: รัน improve ด้วยไหม (ช้ากว่า review ~10 เท่า จึงรันเฉพาะตอนเปิด PR)
+        type: boolean
+        default: true
+      extra_instructions:
+        description: >-
+          checklist เฉพาะโปรเจกต์ — ค่า default จูนมาสำหรับ TypeScript
+          ภาษาอื่นควรส่งของตัวเองมา. สัญญา SECURITY_STATUS ถูกต่อท้ายให้เสมอ
+          และ override ไม่ได้ เพื่อกัน Gate ตายเงียบ
+        type: string
+        default: >-
+          ตรวจตามรายการนี้ทีละข้อ และรายงานเฉพาะข้อที่พบจริงพร้อมชื่อฟังก์ชันและบรรทัด:
+          (1) เรียก async function โดยไม่ใส่ await โดยเฉพาะก่อนนำผลไปเปรียบเทียบหรือคำนวณ
+          (2) สร้าง SQL/query ด้วยการต่อ string จาก input ของผู้ใช้
+          (3) off-by-one ใน loop เช่น i < arr.length - 1 ที่ทำให้ตกสมาชิกตัวสุดท้าย
+          (4) หารด้วยค่าที่อาจเป็นศูนย์ เช่น array.length โดยไม่เช็คก่อน
+          (5) catch block ที่ว่างเปล่าหรือกลืน error โดยไม่ log และไม่ rethrow
+          (6) ใช้ floating point กับจำนวนเงิน
+          (7) ค่า secret/credential ที่ hardcode ไว้ในโค้ด
+    secrets:
+      DASHSCOPE_API_KEY:
+        description: API key จาก QwenCloud
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 40   # ต้อง >= Review(20) + Improve(15) ไม่งั้นกรณีแย่สุดตอนเปิด PR
+                          # job จะโดนตัดที่ระดับ job ก่อน step จะได้รายงานว่าพังตรงไหน
+    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+
+    steps:
+      # ---- 1. เช็ค provider ก่อนเสียเวลาติดตั้งอะไร ----
+      # ไม่ต้องเช็คสองชั้นเหมือนเวอร์ชันเดิมแล้ว เพราะไม่มี proxy มาหลอกว่า 200 ทั้งที่ปลายทางล่ม
+      - name: Preflight - provider
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          API_BASE_INPUT: ${{ inputs.api_base }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          BARE_MODEL="${MODEL#dashscope/}"   # endpoint ดิบรับชื่อ model ล้วน ไม่เอา prefix
+
+          # เลือก endpoint จากชนิดคีย์ — QwenCloud ผูกคีย์กับ base URL สลับกันไม่ได้
+          # (เอกสาร: "The two key types are not interchangeable")
+          case "$DASHSCOPE_API_KEY" in
+            sk-sp-*) GUESS="https://token-plan.maas.qwencloudapi.com/compatible-mode/v1" ;;
+            *)       GUESS="https://maas.qwencloudapi.com/compatible-mode/v1" ;;
+          esac
+          if [ -n "$API_BASE_INPUT" ]; then API_BASE="$API_BASE_INPUT"; else API_BASE="$GUESS"; fi
+          echo "endpoint: $API_BASE"
+
+          # ส่งต่อให้ step Review/Improve ใช้ค่าเดียวกัน ไม่ต้องเดาซ้ำ
+          echo "DASHSCOPE_API_BASE=$API_BASE" >> "$GITHUB_ENV"
+
+          # ⚠️ ห้ามเขียน RESP=$(curl ...) เฉย ๆ — set -e จะฆ่า step ทันทีที่ curl ไม่ใช่ 0
+          #    ข้อความ error ข้างล่างจะไม่ถูกพิมพ์เลย เหลือแค่ "exit code 28"
+          #    ซึ่งชี้ไม่ถูกว่าพังเพราะอะไร
+          RC=0
+          RESP=$(curl -sS --max-time 45 "$API_BASE/chat/completions" \
+                   -H "Content-Type: application/json" \
+                   -H "Authorization: Bearer $DASHSCOPE_API_KEY" \
+                   -d "{\"model\":\"$BARE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8}") || RC=$?
+
+          if [ "$RC" = "28" ]; then
+            # timeout = ปลายทางไม่ว่าง ไม่ใช่ปลายทางตาย — review มีงบเวลาของมันเอง
+            echo "::warning::provider ตอบ ping ไม่ทันใน 45 วินาที — ช้าอยู่ รีวิวต่อแต่จะช้า"
+          elif [ "$RC" != "0" ]; then
+            echo "::error::ต่อ $API_BASE ไม่ได้ (curl exit $RC)"
+            exit 1
+          elif printf '%s' "$RESP" | grep -q '"choices"'; then
+            echo "provider: ok ($BARE_MODEL)"
+          else
+            echo "::error::provider ตอบ error — เช็คตามลำดับ: (1) DASHSCOPE_API_KEY ถูกไหม (2) api_base ตรงภูมิภาคของคีย์ไหม ต้องเป็น -intl สำหรับ QwenCloud นอกจีน (3) ชื่อ model ถูกไหม"
+            printf '%s' "$RESP" | head -c 300
+            exit 1
+          fi
+
+      # ---- 2. ติดตั้ง ----
+      # ไม่ต้อง actions/checkout — pr-agent ดึง diff ผ่าน GitHub API ไม่ได้ใช้ working tree
+      - name: Install pr-agent
+        env:
+          PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "pr-agent==$PR_AGENT_VERSION"
+          pr-agent --help >/dev/null 2>&1 || true
+          echo "pr-agent $PR_AGENT_VERSION installed"
+
+      # ---- 3. รีวิว ----
+      - name: Review
+        timeout-minutes: 20   # กันกรณีแย่สุด 6 × ai_timeout (300s × 6 = 30 นาที) ไม่ให้ไปชน
+                              # timeout ของ job แล้วตายแบบ "job cancelled" ที่ชี้ไม่ถูกว่าพังตรงไหน
+        env:
+          GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+          MODEL: ${{ inputs.model }}
+          AI_TIMEOUT: ${{ inputs.ai_timeout }}
+          MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
+        run: |
+          set -euo pipefail
+
+          # ⚠️ ai_timeout ถูกคูณ 6 ในกรณีแย่สุด อย่าตั้งสูงโดยไม่คิดเลขก่อน:
+          #      pr-agent ลองเอง 2 รอบ (MODEL_RETRIES=2 · tenacity @retry)
+          #      × openai SDK ข้างใน litellm ลองอีก 3 รอบต่อ attempt (max_retries=2 default)
+          #      = 6 requests × ai_timeout  →  300 × 6 = 30 นาที
+          #    ยืนยันได้จาก log ตอน timeout: จะเห็น "Error during LLM inference" 2 ครั้ง
+          #    ห่างกันครั้งละ ≈ 3 × ai_timeout
+          #
+          # ⚠️ fallback_models default ของ pr-agent คือ ["gpt-5.6-terra"] ไม่ใช่ []
+          #    ถ้าไม่ปิด มันจะพยายาม fallback ไป OpenAI เอง — diff หลุดไปผิดที่ได้
+          #
+          # สัญญา SECURITY_STATUS ต่อท้ายตรงนี้เสมอ ไม่เปิดให้ caller override
+          # เพราะ Gate ด้านล่างอ่านบรรทัดนี้ตัดสินว่าจะบล็อก merge ไหม
+          INSTRUCTIONS="$EXTRA_INSTRUCTIONS
+
+          ปิดท้ายส่วน security ด้วยบรรทัดเดียวเป๊ะ ๆ ว่า SECURITY_STATUS: CLEAN ถ้าไม่พบปัญหาด้านความปลอดภัยเลย หรือ SECURITY_STATUS: FINDINGS ถ้าพบ บรรทัดนี้ต้องมีเสมอและห้ามเปลี่ยนรูปแบบ เพราะ CI อ่านบรรทัดนี้ตัดสินว่าจะบล็อก merge ไหม"
+
+          pr-agent --pr_url "$PR_URL" review \
+            --config.model="$MODEL" \
+            --config.fallback_models='[]' \
+            --config.ai_timeout="$AI_TIMEOUT" \
+            --config.custom_model_max_tokens="$MAX_TOKENS" \
+            --pr_reviewer.extra_instructions="$INSTRUCTIONS" \
+            2>&1 | tee "$RUNNER_TEMP/pr-agent.log"
+
+          # ⚠️ pr-agent คืน exit 0 แม้รีวิวล้ม — step จะเขียวทั้งที่ไม่ได้รีวิวอะไรเลย
+          #    แล้วไปโผล่เป็น "ไม่พบคอมเมนต์รีวิว" ที่ Gate ทีหลัง ซึ่งชี้ไปผิดที่
+          #    ห่างจากต้นเหตุจริงเป็นสิบนาที
+          if grep -qE "Failed to review PR|Failed to generate prediction" "$RUNNER_TEMP/pr-agent.log"; then
+            echo "::error::pr-agent รีวิวไม่สำเร็จ (คืน exit 0 แต่ล้มจริง) — ดูบรรทัด ERROR ด้านบน"
+            exit 1
+          fi
+
+      # ---- 3.2 ข้อเสนอแก้โค้ด ----
+      # ไม่ block merge — Gate ตัดสินจากคอมเมนต์ของ review เท่านั้น
+      # รันเฉพาะตอนเปิด PR เพราะ improve ช้ากว่า review ราวสิบเท่า ได้บน diff ใหญ่
+      - name: Improve
+        if: inputs.run_improve && github.event.action != 'synchronize'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MODEL: ${{ inputs.model }}
+          AI_TIMEOUT: ${{ inputs.ai_timeout }}
+          MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
+        run: |
+          set -euo pipefail
+          pr-agent --pr_url "$PR_URL" improve \
+            --config.model="$MODEL" \
+            --config.fallback_models='[]' \
+            --config.ai_timeout="$AI_TIMEOUT" \
+            --config.custom_model_max_tokens="$MAX_TOKENS" \
+            2>&1 | tee "$RUNNER_TEMP/pr-agent-improve.log"
+
+      # ---- 3.3 เก็บกวาด placeholder ของ improve ----
+      # improve โพสต์ "Work in progress ..." ก่อน แล้วค่อยกลับมาแก้เป็นผลลัพธ์
+      # ถ้ามันไม่จบ placeholder จะค้างบน PR ตลอดไป คนเปิด PR มาเห็นแล้วนึกว่ายังรันอยู่
+      # always() ทำงานตอน job โดน cancel/timeout ด้วย ไม่ใช่แค่ตอน fail
+      - name: Clean up stale improve placeholders
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          IDS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                  --jq '.[] | select(.user.login == "github-actions[bot]")
+                            | select(.body | contains("Work in progress"))
+                            | .id') || IDS=""
+          for id in $IDS; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id" \
+              && echo "ลบ placeholder $id" || echo "ลบ $id ไม่สำเร็จ"
+          done
+
+      # ---- 3.5 Gate ----
+      # อ่านคอมเมนต์กลับจาก GitHub — ไม่พึ่ง --output/--json-output ซึ่งเป็น no-op เงียบ ๆ
+      - name: Gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # PR ที่ diff ว่าง (เช่นแก้แต่ lock file) ไม่มีอะไรให้รีวิว — ผ่านไป
+          if grep -q "Empty diff for PR" "$RUNNER_TEMP/pr-agent.log"; then
+            echo "diff ว่างหลังกรองไฟล์ — ข้าม gate"
+            exit 0
+          fi
+
+          BODY=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+                   --json comments \
+                   --jq '[.comments[] | select(.body | contains("PR Reviewer Guide"))] | last | .body // ""')
+
+          # ไม่มีคอมเมนต์ = ไม่มีการรีวิวเกิดขึ้นจริง ห้ามปล่อยผ่าน
+          if [ -z "$BODY" ]; then
+            echo "::error::ไม่พบคอมเมนต์รีวิวใน PR — การรีวิวไม่เกิดขึ้นจริง"
+            exit 1
+          fi
+
+          # ตัดสินจาก token ที่บังคับไว้ใน extra_instructions เท่านั้น
+          # ห้าม grep คำว่า "Security concerns" ลอย ๆ — มันคือ "หัวข้อ" ที่มีทุกครั้งแม้ตอนสะอาด
+          #
+          # ⚠️ คอมเมนต์ GitHub เป็น HTML ไม่ใช่ plain text — pr-agent แทรก tag คั่นกลาง token
+          #    ของจริงที่เคยเจอ: "<strong>No(ขึ้นบรรทัดใหม่)SECURITY_STATUS:</strong><br> CLEAN"
+          #    ต้องถอด tag + ยุบ whitespace ก่อน ไม่งั้น grep ตรง ๆ ไม่มีทางตรง
+          FLAT=$(printf '%s' "$BODY" | sed -e 's/<[^>]*>/ /g' | tr '\n' ' ' | tr -s ' ')
+
+          if printf '%s' "$FLAT" | grep -qE "SECURITY_STATUS:[[:space:]]*FINDINGS"; then
+            echo "::error::AI review พบ security concern — อ่านรายละเอียดในคอมเมนต์ของ PR"
+            exit 1
+          fi
+
+          if printf '%s' "$FLAT" | grep -qE "SECURITY_STATUS:[[:space:]]*CLEAN"; then
+            echo "ไม่พบ security concern"
+            exit 0
+          fi
+
+          if printf '%s' "$FLAT" | grep -q "No security concerns identified"; then
+            echo "ไม่พบ security concern (ประโยคมาตรฐานของ pr-agent)"
+            exit 0
+          fi
+
+          # ไม่มี token เลย = model ไม่ทำตามรูปแบบ ไม่ใช่ว่าเจอปัญหา
+          # เตือนแต่ไม่บล็อก — check แดงตอนที่ไม่มีอะไรผิด จะสอนให้ทีมเลิกสนใจ check
+          # ⚠️ ถ้าเห็น warning นี้บ่อย แปลว่า model ไม่ทำตามสัญญา = Gate กำลังไร้ผลเงียบ ๆ
+          #    ให้รัน scripts/compare-models.sh วัดความสม่ำเสมอใหม่ อย่าปล่อยผ่าน
+          echo "::warning::ไม่พบ SECURITY_STATUS ในคอมเมนต์ — ตัดสินอัตโนมัติไม่ได้ อ่านคอมเมนต์เอง"
+          exit 0
