@@ -122,6 +122,19 @@ jobs:
           MODEL: ${{ inputs.model }}
         run: |
           set -euo pipefail
+
+          # เช็คก่อนเลยว่า secret มาถึงไหม — เคสที่เจอบ่อยที่สุดตอนเพิ่ม repo ใหม่
+          # คือลืมใส่ secret ที่ repo นั้น เพราะแพลน Free ไม่มี secret ระดับ account
+          # ถ้าไม่ดักตรงนี้ provider จะตอบ "No API-key provided" ซึ่งอ่านแล้วนึกว่าคีย์ผิด
+          if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
+            echo "::error::secret DASHSCOPE_API_KEY ว่างเปล่าหรือไม่มีใน repo นี้"
+            echo "ไปใส่ที่ Settings > Secrets and variables > Actions > New repository secret"
+            echo "  https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions"
+            echo "ต้องใส่ทุก repo ที่ถูกรีวิว — reusable workflow รับ secret จาก caller เสมอ"
+            echo "และแพลน Free ไม่มี secret ระดับ account ให้ใช้ร่วมกัน"
+            exit 1
+          fi
+
           BARE_MODEL="${MODEL#dashscope/}"   # endpoint ดิบรับชื่อ model ล้วน ไม่เอา prefix
 
           # เลือก endpoint จากชนิดคีย์ — QwenCloud ผูกคีย์กับ base URL สลับกันไม่ได้
