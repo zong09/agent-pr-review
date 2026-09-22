@@ -49,6 +49,7 @@ config ส่งผ่าน env กับ CLI ล้วน จึงไม่�
 | `api_base` | ว่าง = เดาจาก prefix ของคีย์ | ดูตารางกับดักข้างบน |
 | `ai_timeout` | `480` | วินาทีต่อ request — **ถูกคูณ 6** ดูด้านล่าง |
 | `custom_model_max_tokens` | `40000` | จำเป็นเมื่อ model ไม่อยู่ใน price map ของ litellm |
+| `max_model_tokens` | `32000` | **ตัวจำกัดชั้นที่สอง ครอบทับตัวบนเสมอ** ดูหัวข้อด้านล่าง |
 | `pr_agent_version` | `0.44.0` | ปักหมุดไว้ อย่าปล่อย latest |
 | `run_improve` | `true` | ปิดเพื่อประหยัด GitHub minutes |
 | `include_pr_comments` | `true` | เอาคอมเมนต์ใน PR มาเป็นบริบท ดูหัวข้อด้านล่าง |
@@ -143,6 +144,37 @@ workflow นี้เติมชั้นนั้นให้เอง โด�
 
 ⚠️ สามชั้นนี้ลดความเสี่ยง ไม่ได้กำจัด — คนที่เป็น collaborator ยังเขียนอะไรเข้า prompt ได้อยู่
 ถ้า repo ไหนที่ Gate ต้องเชื่อถือได้จริงจัง แนะนำให้ปิดฟีเจอร์นี้
+
+## เพดาน token มีสองชั้น ต้องขยับพร้อมกัน
+
+ถ้าเห็นบรรทัดนี้ใน log แปลว่า diff ถูกตัดทิ้งบางส่วน และ**ไฟล์ที่ถูกตัดจะไม่ถูกรีวิวเลย**
+
+```
+Tokens: 43599, total tokens over limit: 32000, pruning diff.
+```
+
+กับดักคือ `custom_model_max_tokens` อย่างเดียว**ไม่มีผล** เพราะ `get_max_tokens()` ทำแบบนี้
+
+```python
+max_tokens_model = min(max_model_tokens, max_tokens_model)
+```
+
+`config.max_model_tokens` มี default 32000 และครอบทับเสมอ ตั้ง `custom_model_max_tokens`
+เป็นเท่าไรก็ไม่เกิน 32000 — ต้องตั้งสองตัวให้เท่ากัน
+
+```yaml
+    with:
+      custom_model_max_tokens: 64000
+      max_model_tokens: 64000
+```
+
+pr-agent จงใจครอบไว้ โดย docstring อธิบายว่า *"the AI model degrades in performance
+when the input is too long"* การขยายจึงมีต้นทุนเชิงคุณภาพจริง ไม่ใช่ของฟรี
+ขยายเท่าที่จำเป็นโดยดูเลข `Tokens: N` ใน log เป็นเกณฑ์ อย่าตั้งสูงไว้ก่อน
+
+⚠️ ที่อันตรายคือมัน**ตัดเงียบ ๆ** รีวิวจะออกมาดูสมบูรณ์ทั้งที่ไม่เคยเห็นไฟล์สำคัญ
+สังเกตได้จากบรรทัด "not included in this review because of the token budget" ในคอมเมนต์
+หรือ `pruning diff` ใน log เท่านั้น
 
 ## เมื่อ Gate บล็อกความเสี่ยงที่คุณยอมรับแล้ว
 
