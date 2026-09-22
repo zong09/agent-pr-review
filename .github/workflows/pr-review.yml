@@ -80,6 +80,14 @@ on:
           ปิดได้ถ้าไม่สบายใจ
         type: boolean
         default: true
+      trusted_comment_authors:
+        description: >-
+          รายชื่อ GitHub username เพิ่มเติมที่ให้ถือว่าคอมเมนต์เชื่อถือได้ คั่นด้วยคอมมา
+          ใช้เมื่อคุณคอมเมนต์จากบัญชีอื่นที่ไม่ได้เป็น collaborator ของ repo
+          ซึ่งจะได้ author_association เป็น CONTRIBUTOR หรือ NONE แล้วถูกกรองทิ้ง
+          ⚠️ ทุกชื่อในนี้เขียนอะไรเข้า prompt ก็ได้ ใส่เฉพาะบัญชีที่เป็นของคุณเองหรือไว้ใจจริง
+        type: string
+        default: ""
       run_improve:
         description: รัน improve ด้วยไหม (ช้ากว่า review ~10 เท่า จึงรันเฉพาะตอนเปิด PR)
         type: boolean
@@ -202,6 +210,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INCLUDE_COMMENTS: ${{ inputs.include_pr_comments }}
+          TRUSTED_AUTHORS: ${{ inputs.trusted_comment_authors }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
           MODEL: ${{ inputs.model }}
           AI_TIMEOUT: ${{ inputs.ai_timeout }}
@@ -219,12 +228,34 @@ jobs:
           #    (3) วางบล็อกนี้ "ก่อน" สัญญา SECURITY_STATUS เสมอ คำสั่งที่อยู่ท้ายสุดจึงยังเป็นของเรา
           COMMENTS=""
           if [ "${INCLUDE_COMMENTS:-true}" = "true" ]; then
-            JQ='[.[] | select(.user.type != "Bot")
-                     | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
-                     | "- @\(.user.login): \(.body)"] | join("\n")'
-            A=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --jq "$JQ" 2>/dev/null) || A=""
-            B=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/comments" --paginate --jq "$JQ" 2>/dev/null) || B=""
-            COMMENTS=$(printf '%s\n%s' "$A" "$B" | sed '/^$/d' | head -c 4000)
+            # GitHub แยกคอมเมนต์เป็นสามชนิดคนละ endpoint ต้องดึงให้ครบ
+            #   issues/N/comments  = คอมเมนต์ในบทสนทนา
+            #   pulls/N/comments   = คอมเมนต์ inline บนบรรทัดโค้ด
+            #   pulls/N/reviews    = ตัว review เอง (กดปุ่ม Review changes) <- ลืมง่ายที่สุด
+            # ⚠️ ต้อง bind object ไว้เป็น $c ก่อน — ข้างใน index(...) ตัว . จะกลายเป็น array
+            #    ที่กำลังค้นหา ไม่ใช่ object เดิม เขียน .user.login ตรงนั้นจะพังด้วย
+            #    "Cannot index array with string" แล้วถูก 2>/dev/null กลืนจนคืนค่าว่างเงียบ ๆ
+            JQ='[ (add // [])[]
+                  | select(.user.type != "Bot")
+                  | . as $c
+                  | ($c.user.login | ascii_downcase) as $login
+                  | ($trusted | split(",") | map(ascii_downcase | gsub("^\\s+|\\s+$";""))) as $t
+                  | select($c.author_association == "OWNER" or $c.author_association == "MEMBER"
+                           or $c.author_association == "COLLABORATOR"
+                           or ($t | index($login)) != null)
+                  | select((($c.body // "") | length) > 0)
+                  | "- @\($c.user.login): \($c.body)" ] | join("\n")'
+            ALL=""
+            for EP in "issues/$PR_NUMBER/comments" "pulls/$PR_NUMBER/comments" "pulls/$PR_NUMBER/reviews"; do
+              # ไม่ปิดปาก stderr ของ jq — บั๊กของ filter เคยถูกกลืนจนคืนค่าว่างเงียบ ๆ
+              # ฟีเจอร์จะดูเหมือนทำงานแต่ไม่เคยแนบคอมเมนต์เลย
+              X=$(gh api "repos/$GITHUB_REPOSITORY/$EP" --paginate 2>/dev/null \
+                    | jq -rs --arg trusted "${TRUSTED_AUTHORS:-}" "$JQ") \
+                || { echo "::warning::ดึงคอมเมนต์จาก $EP ไม่สำเร็จ"; X=""; }
+              [ -n "$X" ] && ALL="$ALL
+          $X"
+            done
+            COMMENTS=$(printf '%s' "$ALL" | sed '/^[[:space:]]*$/d' | head -c 4000)
           fi
 
           CONTEXT=""
