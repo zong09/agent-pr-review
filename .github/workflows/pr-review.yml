@@ -245,8 +245,14 @@ jobs:
                            or ($t | index($login)) != null)
                   | select((($c.body // "") | length) > 0)
                   | "- @\($c.user.login): \($c.body)" ] | join("\n")'
+            # บอกด้วยว่าแต่ละ endpoint มีอะไรบ้างและ association เป็นอะไร
+            # ไม่งั้นเวลาไม่ match จะได้แค่ "ไม่มีคอมเมนต์" แล้วต้องมานั่งเดาว่าทำไม
+            # (ไม่พิมพ์เนื้อคอมเมนต์ พิมพ์แค่ชื่อกับ association)
             ALL=""
             for EP in "issues/$PR_NUMBER/comments" "pulls/$PR_NUMBER/comments" "pulls/$PR_NUMBER/reviews"; do
+              SEEN=$(gh api "repos/$GITHUB_REPOSITORY/$EP" --paginate 2>/dev/null \
+                       | jq -rs '[(add // [])[] | "\(.user.login)/\(.author_association)"] | unique | join(", ")') || SEEN="?"
+              echo "  $EP -> ${SEEN:-ว่าง}"
               # ไม่ปิดปาก stderr ของ jq — บั๊กของ filter เคยถูกกลืนจนคืนค่าว่างเงียบ ๆ
               # ฟีเจอร์จะดูเหมือนทำงานแต่ไม่เคยแนบคอมเมนต์เลย
               X=$(gh api "repos/$GITHUB_REPOSITORY/$EP" --paginate 2>/dev/null \
