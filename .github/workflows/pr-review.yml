@@ -76,6 +76,20 @@ on:
           ขยายเมื่อเห็น "total tokens over limit ... pruning diff" ใน log เท่านั้น
         type: number
         default: 32000
+      review_timeout_minutes:
+        description: >-
+          เพดานเวลาของ step Review — diff ใหญ่ทำให้ prompt ใหญ่และช้าตาม
+          ถ้าเจอ "The action 'Review' has timed out" ให้ขยายตัวนี้
+          แต่ก่อนขยายควรวัดก่อนด้วย scripts/compare-models.sh บน diff ขนาดจริง
+          เพราะบางทีเปลี่ยน model ได้ผลดีกว่าการยืดเวลา
+        type: number
+        default: 20
+      job_timeout_minutes:
+        description: >-
+          เพดานเวลาของ job ทั้งก้อน ต้อง >= review_timeout_minutes + 15 (เวลาของ improve)
+          ไม่งั้น job จะถูกตัดที่ระดับ job ก่อน step จะได้รายงานว่าพังตรงไหน
+        type: number
+        default: 40
       pr_agent_version:
         description: >-
           ปักหมุดเวอร์ชันไว้ ไม่ปักแล้ววันหนึ่ง upstream เปลี่ยนพฤติกรรม
@@ -134,8 +148,7 @@ jobs:
   review:
     name: review
     runs-on: ubuntu-latest
-    timeout-minutes: 40   # ต้อง >= Review(20) + Improve(15) ไม่งั้นกรณีแย่สุดตอนเปิด PR
-                          # job จะโดนตัดที่ระดับ job ก่อน step จะได้รายงานว่าพังตรงไหน
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
 
     steps:
@@ -211,8 +224,7 @@ jobs:
 
       # ---- 3. รีวิว ----
       - name: Review
-        timeout-minutes: 20   # กันกรณีแย่สุด 6 × ai_timeout (300s × 6 = 30 นาที) ไม่ให้ไปชน
-                              # timeout ของ job แล้วตายแบบ "job cancelled" ที่ชี้ไม่ถูกว่าพังตรงไหน
+        timeout-minutes: ${{ inputs.review_timeout_minutes }}
         env:
           GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
