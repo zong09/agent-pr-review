@@ -90,6 +90,16 @@ on:
           ไม่งั้น job จะถูกตัดที่ระดับ job ก่อน step จะได้รายงานว่าพังตรงไหน
         type: number
         default: 40
+      fallback_model:
+        description: >-
+          model สำรองเมื่อตัวหลักล้ม ปล่อยว่าง = ใช้ตัวเดียวกับ model
+          ⚠️ ห้ามปล่อยให้เป็นค่า default ของ pr-agent เด็ดขาด เพราะ default คือ
+          โมเดลของ OpenAI แปลว่า diff จะถูกส่งออกไปอีก provider หนึ่งเมื่อตัวหลักล้ม
+          และการสั่ง --config.fallback_models='[]' เพื่อล้างค่า "ไม่ได้ผล"
+          (พบจริงจาก log: all_models = ['dashscope/qwen3.8-max', 'gpt-5.6-terra'])
+          จึงต้องระบุตัวสำรองของ provider เดียวกันทับลงไปแทนการล้าง
+        type: string
+        default: ""
       pr_agent_version:
         description: >-
           ปักหมุดเวอร์ชันไว้ ไม่ปักแล้ววันหนึ่ง upstream เปลี่ยนพฤติกรรม
@@ -238,6 +248,7 @@ jobs:
           AI_TIMEOUT: ${{ inputs.ai_timeout }}
           MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
           MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
+          FALLBACK_MODEL: ${{ inputs.fallback_model || inputs.model }}
         run: |
           set -euo pipefail
 
@@ -321,7 +332,7 @@ jobs:
 
           pr-agent --pr_url "$PR_URL" review \
             --config.model="$MODEL" \
-            --config.fallback_models='[]' \
+            --config.fallback_models="[\"$FALLBACK_MODEL\"]" \
             --config.ai_timeout="$AI_TIMEOUT" \
             --config.custom_model_max_tokens="$MAX_TOKENS" \
             --config.max_model_tokens="$MAX_MODEL_TOKENS" \
@@ -351,11 +362,12 @@ jobs:
           AI_TIMEOUT: ${{ inputs.ai_timeout }}
           MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
           MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
+          FALLBACK_MODEL: ${{ inputs.fallback_model || inputs.model }}
         run: |
           set -euo pipefail
           pr-agent --pr_url "$PR_URL" improve \
             --config.model="$MODEL" \
-            --config.fallback_models='[]' \
+            --config.fallback_models="[\"$FALLBACK_MODEL\"]" \
             --config.ai_timeout="$AI_TIMEOUT" \
             --config.custom_model_max_tokens="$MAX_TOKENS" \
             --config.max_model_tokens="$MAX_MODEL_TOKENS" \
