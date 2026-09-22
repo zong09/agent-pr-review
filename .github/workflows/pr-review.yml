@@ -66,6 +66,16 @@ on:
         description: context window ที่บอก pr-agent (จำเป็นเมื่อ model ไม่อยู่ใน price map ของ litellm)
         type: number
         default: 40000
+      max_model_tokens:
+        description: >-
+          ⚠️ ตัวจำกัดชั้นที่สอง ที่ครอบทับ custom_model_max_tokens เสมอ
+          get_max_tokens() ทำ min(max_model_tokens, custom_model_max_tokens)
+          default ของ pr-agent คือ 32000 ดังนั้นตั้ง custom_model_max_tokens อย่างเดียว
+          จะไม่มีทางเกิน 32000 ต้องขยับสองตัวพร้อมกัน
+          pr-agent จงใจครอบไว้เพราะคุณภาพของโมเดลตกเมื่อ input ยาวเกินไป
+          ขยายเมื่อเห็น "total tokens over limit ... pruning diff" ใน log เท่านั้น
+        type: number
+        default: 32000
       pr_agent_version:
         description: >-
           ปักหมุดเวอร์ชันไว้ ไม่ปักแล้ววันหนึ่ง upstream เปลี่ยนพฤติกรรม
@@ -215,6 +225,7 @@ jobs:
           MODEL: ${{ inputs.model }}
           AI_TIMEOUT: ${{ inputs.ai_timeout }}
           MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
+          MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
         run: |
           set -euo pipefail
 
@@ -301,6 +312,7 @@ jobs:
             --config.fallback_models='[]' \
             --config.ai_timeout="$AI_TIMEOUT" \
             --config.custom_model_max_tokens="$MAX_TOKENS" \
+            --config.max_model_tokens="$MAX_MODEL_TOKENS" \
             --pr_reviewer.extra_instructions="$INSTRUCTIONS" \
             2>&1 | tee "$RUNNER_TEMP/pr-agent.log"
 
@@ -326,6 +338,7 @@ jobs:
           MODEL: ${{ inputs.model }}
           AI_TIMEOUT: ${{ inputs.ai_timeout }}
           MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
+          MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
         run: |
           set -euo pipefail
           pr-agent --pr_url "$PR_URL" improve \
@@ -333,6 +346,7 @@ jobs:
             --config.fallback_models='[]' \
             --config.ai_timeout="$AI_TIMEOUT" \
             --config.custom_model_max_tokens="$MAX_TOKENS" \
+            --config.max_model_tokens="$MAX_MODEL_TOKENS" \
             2>&1 | tee "$RUNNER_TEMP/pr-agent-improve.log"
 
       # ---- 3.3 เก็บกวาด placeholder ของ improve ----
