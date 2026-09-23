@@ -127,6 +127,17 @@ on:
           ⚠️ ทุกชื่อในนี้เขียนอะไรเข้า prompt ก็ได้ ใส่เฉพาะบัญชีที่เป็นของคุณเองหรือไว้ใจจริง
         type: string
         default: ""
+      ignore_glob:
+        description: >-
+          ไฟล์ที่ไม่ต้องส่งเข้า model — รูปแบบ JSON list ของ glob เช่น
+          '["tests/**","**/*.css","**/*.snap"]'
+          ลดขนาด prompt ตรง ๆ จึงลดเวลารีวิวตามสัดส่วนบรรทัดที่ตัดออก
+          ⚠️ เป็น trade-off ไม่ใช่ของฟรี: ไฟล์ที่ตัดออกจะไม่ถูกรีวิวเลย
+          บั๊กในไฟล์เทสต์จะหลุด และป้าย "PR contains tests" จะไม่ตรงความจริง
+          (pr-agent แปลง glob ด้วย fnmatch.translate ดังนั้น * ข้าม / ได้
+          "tests/**" จึงครอบ subdirectory ทั้งหมดอยู่แล้ว)
+        type: string
+        default: ""
       run_improve:
         description: รัน improve ด้วยไหม (ช้ากว่า review ~10 เท่า จึงรันเฉพาะตอนเปิด PR)
         type: boolean
@@ -167,6 +178,7 @@ jobs:
     if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
 
     steps:
+
       # ---- 1. เช็ค provider ก่อนเสียเวลาติดตั้งอะไร ----
       # ไม่ต้องเช็คสองชั้นเหมือนเวอร์ชันเดิมแล้ว เพราะไม่มี proxy มาหลอกว่า 200 ทั้งที่ปลายทางล่ม
       - name: Preflight - provider
@@ -245,6 +257,14 @@ jobs:
 
       # ---- 2. ติดตั้ง ----
       # ไม่ต้อง actions/checkout — pr-agent ดึง diff ผ่าน GitHub API ไม่ได้ใช้ working tree
+      # cache wheel ไว้ เพราะ pr-agent ลากทั้ง litellm/openai มาด้วย การดาวน์โหลด
+      # คือส่วนใหญ่ของเวลาติดตั้ง (วัดได้ 49-61 วินาทีตอนไม่มี cache)
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-pr-agent-${{ runner.os }}-${{ inputs.pr_agent_version }}
+
       - name: Install pr-agent
         env:
           PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
@@ -253,6 +273,7 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check "pr-agent==$PR_AGENT_VERSION"
           pr-agent --help >/dev/null 2>&1 || true
           echo "pr-agent $PR_AGENT_VERSION installed"
+
 
       # ---- 3. รีวิว ----
       - name: Review
@@ -271,6 +292,7 @@ jobs:
           MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
           MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
           FALLBACK_MODEL: ${{ inputs.fallback_model || inputs.model }}
+          IGNORE_GLOB: ${{ inputs.ignore_glob }}
         run: |
           set -euo pipefail
 
@@ -352,7 +374,16 @@ jobs:
 
           ปิดท้ายส่วน security ด้วยบรรทัดเดียวเป๊ะ ๆ ว่า SECURITY_STATUS: CLEAN ถ้าไม่พบปัญหาด้านความปลอดภัยเลย หรือ SECURITY_STATUS: FINDINGS ถ้าพบ บรรทัดนี้ต้องมีเสมอและห้ามเปลี่ยนรูปแบบ เพราะ CI อ่านบรรทัดนี้ตัดสินว่าจะบล็อก merge ไหม"
 
+          # ตัดไฟล์ที่ไม่อยากให้ model อ่าน — อาร์เรย์ว่างปลอดภัยใน bash 4.4+
+          # (ubuntu-latest เป็น bash 5) จึงไม่ต้องแยกเคส
+          IGNORE_ARGS=()
+          if [ -n "${IGNORE_GLOB:-}" ]; then
+            IGNORE_ARGS+=(--ignore.glob="$IGNORE_GLOB")
+            echo "ตัดไฟล์ตาม glob: $IGNORE_GLOB"
+          fi
+
           pr-agent --pr_url "$PR_URL" review \
+            "${IGNORE_ARGS[@]}" \
             --config.model="$MODEL" \
             --config.fallback_models="[\"$FALLBACK_MODEL\"]" \
             --config.ai_timeout="$AI_TIMEOUT" \
@@ -369,52 +400,6 @@ jobs:
             exit 1
           fi
 
-      # ---- 3.2 ข้อเสนอแก้โค้ด ----
-      # ไม่ block merge — Gate ตัดสินจากคอมเมนต์ของ review เท่านั้น
-      # รันเฉพาะตอนเปิด PR เพราะ improve ช้ากว่า review ราวสิบเท่า ได้บน diff ใหญ่
-      - name: Improve
-        if: inputs.run_improve && github.event.action != 'synchronize'
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          MODEL: ${{ inputs.model }}
-          AI_TIMEOUT: ${{ inputs.ai_timeout }}
-          MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
-          MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
-          FALLBACK_MODEL: ${{ inputs.fallback_model || inputs.model }}
-        run: |
-          set -euo pipefail
-          pr-agent --pr_url "$PR_URL" improve \
-            --config.model="$MODEL" \
-            --config.fallback_models="[\"$FALLBACK_MODEL\"]" \
-            --config.ai_timeout="$AI_TIMEOUT" \
-            --config.custom_model_max_tokens="$MAX_TOKENS" \
-            --config.max_model_tokens="$MAX_MODEL_TOKENS" \
-            2>&1 | tee "$RUNNER_TEMP/pr-agent-improve.log"
-
-      # ---- 3.3 เก็บกวาด placeholder ของ improve ----
-      # improve โพสต์ "Work in progress ..." ก่อน แล้วค่อยกลับมาแก้เป็นผลลัพธ์
-      # ถ้ามันไม่จบ placeholder จะค้างบน PR ตลอดไป คนเปิด PR มาเห็นแล้วนึกว่ายังรันอยู่
-      # always() ทำงานตอน job โดน cancel/timeout ด้วย ไม่ใช่แค่ตอน fail
-      - name: Clean up stale improve placeholders
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -uo pipefail
-          IDS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-                  --jq '.[] | select(.user.login == "github-actions[bot]")
-                            | select(.body | contains("Work in progress"))
-                            | .id') || IDS=""
-          for id in $IDS; do
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id" \
-              && echo "ลบ placeholder $id" || echo "ลบ $id ไม่สำเร็จ"
-          done
 
       # ---- 3.5 Gate ----
       # อ่านคอมเมนต์กลับจาก GitHub — ไม่พึ่ง --output/--json-output ซึ่งเป็น no-op เงียบ ๆ
@@ -470,3 +455,104 @@ jobs:
           #    ให้รัน scripts/compare-models.sh วัดความสม่ำเสมอใหม่ อย่าปล่อยผ่าน
           echo "::warning::ไม่พบ SECURITY_STATUS ในคอมเมนต์ — ตัดสินอัตโนมัติไม่ได้ อ่านคอมเมนต์เอง"
           exit 0
+
+  # job แยก เพื่อให้ improve รันขนานกับ review แทนที่จะต่อคิว
+  # วัดจาก cane PR #33: review 1589s + improve 913s = 42 นาทีเมื่อต่อกัน
+  # แยกแล้วเวลารวมเท่ากับตัวที่ช้ากว่า คือ ~27 นาที
+  # ⚠️ Gate อยู่ใน job review เท่านั้น improve ไม่มีสิทธิ์บล็อก merge เหมือนเดิม
+  improve:
+    name: improve
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+
+    steps:
+      # ---- 1. หา endpoint (ฉบับย่อ) ----
+      # job review ตรวจ secret / ping / ความสัมพันธ์ ai_timeout ให้แล้ว
+      # ตรงนี้ต้องการแค่ base URL จึงไม่ ping ซ้ำ ประหยัดไปอีก 45 วินาที
+      - name: Resolve endpoint
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          API_BASE_INPUT: ${{ inputs.api_base }}
+        run: |
+          set -euo pipefail
+          case "$DASHSCOPE_API_KEY" in
+            sk-sp-*) GUESS="https://token-plan.maas.qwencloudapi.com/compatible-mode/v1" ;;
+            *)       GUESS="https://maas.qwencloudapi.com/compatible-mode/v1" ;;
+          esac
+          if [ -n "$API_BASE_INPUT" ]; then API_BASE="$API_BASE_INPUT"; else API_BASE="$GUESS"; fi
+          echo "DASHSCOPE_API_BASE=$API_BASE" >> "$GITHUB_ENV"
+
+      - name: Cache pip wheels
+        if: inputs.run_improve && github.event.action != 'synchronize'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-pr-agent-${{ runner.os }}-${{ inputs.pr_agent_version }}
+
+      - name: Install pr-agent
+        if: inputs.run_improve && github.event.action != 'synchronize'
+        env:
+          PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "pr-agent==$PR_AGENT_VERSION"
+          echo "pr-agent $PR_AGENT_VERSION installed"
+
+
+      # ---- 3.2 ข้อเสนอแก้โค้ด ----
+      # ไม่ block merge — Gate ตัดสินจากคอมเมนต์ของ review เท่านั้น
+      # รันเฉพาะตอนเปิด PR เพราะ improve ช้ากว่า review ราวสิบเท่า ได้บน diff ใหญ่
+      - name: Improve
+        if: inputs.run_improve && github.event.action != 'synchronize'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MODEL: ${{ inputs.model }}
+          AI_TIMEOUT: ${{ inputs.ai_timeout }}
+          MAX_TOKENS: ${{ inputs.custom_model_max_tokens }}
+          MAX_MODEL_TOKENS: ${{ inputs.max_model_tokens }}
+          FALLBACK_MODEL: ${{ inputs.fallback_model || inputs.model }}
+          IGNORE_GLOB: ${{ inputs.ignore_glob }}
+        run: |
+          set -euo pipefail
+          # ห้ามเขียน [ ... ] && IGNORE_ARGS+=(...) ภายใต้ set -e
+          # เพราะถ้าเงื่อนไขเป็นเท็จ ทั้งบรรทัดคืน 1 แล้ว step จะตายทั้งที่ไม่มีอะไรผิด
+          IGNORE_ARGS=()
+          if [ -n "${IGNORE_GLOB:-}" ]; then
+            IGNORE_ARGS+=(--ignore.glob="$IGNORE_GLOB")
+          fi
+
+          pr-agent --pr_url "$PR_URL" improve \
+            "${IGNORE_ARGS[@]}" \
+            --config.model="$MODEL" \
+            --config.fallback_models="[\"$FALLBACK_MODEL\"]" \
+            --config.ai_timeout="$AI_TIMEOUT" \
+            --config.custom_model_max_tokens="$MAX_TOKENS" \
+            --config.max_model_tokens="$MAX_MODEL_TOKENS" \
+            2>&1 | tee "$RUNNER_TEMP/pr-agent-improve.log"
+
+
+      # ---- 3.3 เก็บกวาด placeholder ของ improve ----
+      # improve โพสต์ "Work in progress ..." ก่อน แล้วค่อยกลับมาแก้เป็นผลลัพธ์
+      # ถ้ามันไม่จบ placeholder จะค้างบน PR ตลอดไป คนเปิด PR มาเห็นแล้วนึกว่ายังรันอยู่
+      # always() ทำงานตอน job โดน cancel/timeout ด้วย ไม่ใช่แค่ตอน fail
+      - name: Clean up stale improve placeholders
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          IDS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                  --jq '.[] | select(.user.login == "github-actions[bot]")
+                            | select(.body | contains("Work in progress"))
+                            | .id') || IDS=""
+          for id in $IDS; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id" \
+              && echo "ลบ placeholder $id" || echo "ลบ $id ไม่สำเร็จ"
+          done
