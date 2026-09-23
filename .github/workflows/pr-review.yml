@@ -60,6 +60,11 @@ on:
           วินาทีต่อ 1 request — ดูคำเตือนเรื่องตัวคูณ 6 ที่ step Review
           480 มาจาก flash ที่วัดได้ช้าสุด 189s × 2.5 เผื่อ prompt จริงที่ยาวกว่า
           (ถ้าเปลี่ยนไปใช้ max ลดเหลือ 300 ได้ เพราะแกว่งน้อยกว่ามาก)
+          ⚠️ ข้อบังคับ: ai_timeout × 2 ต้องน้อยกว่า review_timeout_minutes × 60
+          เพราะ request แรกที่ค้างจะกิน ai_timeout เต็มก่อน retry ถ้าตั้งใหญ่เกิน
+          retry จะไม่มีทางทำงานจบ และ log จะบอกแค่ "step timed out"
+          ปิดบัง error จริงจาก provider — ตั้งใหญ่ไม่ได้แปลว่าทนทานกว่า
+          Preflight ดักให้แล้ว ถ้าผิดจะ fail ทันทีพร้อมบอกค่าที่ควรใช้
         type: number
         default: 480
       custom_model_max_tokens:
@@ -169,6 +174,8 @@ jobs:
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           API_BASE_INPUT: ${{ inputs.api_base }}
           MODEL: ${{ inputs.model }}
+          AI_TIMEOUT: ${{ inputs.ai_timeout }}
+          REVIEW_MIN: ${{ inputs.review_timeout_minutes }}
         run: |
           set -euo pipefail
 
@@ -181,6 +188,21 @@ jobs:
             echo "  https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions"
             echo "ต้องใส่ทุก repo ที่ถูกรีวิว — reusable workflow รับ secret จาก caller เสมอ"
             echo "และแพลน Free ไม่มี secret ระดับ account ให้ใช้ร่วมกัน"
+            exit 1
+          fi
+
+          # ai_timeout ที่ใหญ่เกิน review_timeout_minutes ทำให้ retry เป็นของประดับ
+          # เจอจริงที่ cane PR #33: ai_timeout 1200 + review 30 → step ตายที่ 30 นาที
+          # ทุกครั้ง โดยไม่เคยแสดง error จริงจาก provider เลยสักรอบ
+          BUDGET=$(( REVIEW_MIN * 60 ))
+          if [ $(( AI_TIMEOUT * 2 )) -ge "$BUDGET" ]; then
+            echo "::error::ai_timeout=$AI_TIMEOUT ใหญ่เกินไปเทียบกับ review_timeout_minutes=$REVIEW_MIN"
+            echo "pr-agent ซ้อน retry สองชั้น (tenacity 2 × OpenAI SDK 3) request แรกที่ค้าง"
+            echo "จะกิน ai_timeout เต็มก่อน retry ถ้า ai_timeout×2 >= เพดานของ step"
+            echo "retry จะไม่มีทางทำงานจบ และคุณจะเห็นแค่ 'The action Review has timed out'"
+            echo "แก้อย่างใดอย่างหนึ่ง:"
+            echo "  ai_timeout <= $(( BUDGET / 2 - 1 ))  (คงเพดาน step ไว้เท่าเดิม)"
+            echo "  review_timeout_minutes >= $(( (AI_TIMEOUT * 2) / 60 + 1 ))  (คง ai_timeout ไว้เท่าเดิม)"
             exit 1
           fi
 
