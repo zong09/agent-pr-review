@@ -60,13 +60,14 @@ on:
           วินาทีต่อ 1 request — ดูคำเตือนเรื่องตัวคูณ 6 ที่ step Review
           480 มาจาก flash ที่วัดได้ช้าสุด 189s × 2.5 เผื่อ prompt จริงที่ยาวกว่า
           (ถ้าเปลี่ยนไปใช้ max ลดเหลือ 300 ได้ เพราะแกว่งน้อยกว่ามาก)
-          ⚠️ ข้อบังคับ: ai_timeout × 2 ต้องน้อยกว่า review_timeout_minutes × 60
-          เพราะ request แรกที่ค้างจะกิน ai_timeout เต็มก่อน retry ถ้าตั้งใหญ่เกิน
-          retry จะไม่มีทางทำงานจบ และ log จะบอกแค่ "step timed out"
-          ปิดบัง error จริงจาก provider — ตั้งใหญ่ไม่ได้แปลว่าทนทานกว่า
-          Preflight ดักให้แล้ว ถ้าผิดจะ fail ทันทีพร้อมบอกค่าที่ควรใช้
+          ⚠️ ข้อบังคับ: ai_timeout × 6 ควรน้อยกว่า review_timeout_minutes × 60
+          retry ซ้อนสองชั้น — SDK 3 ครั้งต่อ attempt × tenacity 2 attempt = 6
+          ถ้าตั้งใหญ่เกิน step จะถูกตัดก่อน pr-agent จะรายงาน error ของตัวเอง
+          เหลือแค่ "step timed out" ซึ่งปิดบังสาเหตุจริงทั้งหมด
+          ตั้งใหญ่จึงไม่ได้แปลว่าทนทานกว่า แต่แปลว่ามองไม่เห็นว่าพังเพราะอะไร
+          Preflight บล็อกที่ × 3 และเตือนที่ × 6 พร้อมบอกค่าที่ควรใช้
         type: number
-        default: 480
+        default: 400
       custom_model_max_tokens:
         description: context window ที่บอก pr-agent (จำเป็นเมื่อ model ไม่อยู่ใน price map ของ litellm)
         type: number
@@ -87,14 +88,16 @@ on:
           ถ้าเจอ "The action 'Review' has timed out" ให้ขยายตัวนี้
           แต่ก่อนขยายควรวัดก่อนด้วย scripts/compare-models.sh บน diff ขนาดจริง
           เพราะบางทีเปลี่ยน model ได้ผลดีกว่าการยืดเวลา
+          45 มาจาก ai_timeout 400 × 6 = 40 นาที + เผื่อ — ตั้งให้ retry ครบชั้น
+          ทำงานจบได้ ไม่งั้นจะไม่มีวันเห็น error จริงจาก provider
         type: number
-        default: 20
+        default: 45
       job_timeout_minutes:
         description: >-
           เพดานเวลาของ job ทั้งก้อน ต้อง >= review_timeout_minutes + 15 (เวลาของ improve)
           ไม่งั้น job จะถูกตัดที่ระดับ job ก่อน step จะได้รายงานว่าพังตรงไหน
         type: number
-        default: 40
+        default: 60
       fallback_model:
         description: >-
           model สำรองเมื่อตัวหลักล้ม ปล่อยว่าง = ใช้ตัวเดียวกับ model
@@ -203,19 +206,37 @@ jobs:
             exit 1
           fi
 
-          # ai_timeout ที่ใหญ่เกิน review_timeout_minutes ทำให้ retry เป็นของประดับ
-          # เจอจริงที่ cane PR #33: ai_timeout 1200 + review 30 → step ตายที่ 30 นาที
-          # ทุกครั้ง โดยไม่เคยแสดง error จริงจาก provider เลยสักรอบ
+          # โครงสร้าง retry ที่วัดได้จริง ไม่ใช่ที่เดา:
+          #   OpenAI SDK ลอง 3 ครั้งต่อ 1 attempt ของ tenacity (ชั้นใน)
+          #   tenacity ลอง 2 attempt (ชั้นนอก · MODEL_RETRIES=2)
+          #   กรณีแย่สุดจึงเป็น 6 × ai_timeout
+          #
+          # หลักฐาน: cane PR #34 run 35849347567 ตั้ง ai_timeout=700 review=35
+          #   3 × 700 = 2100 วินาที · step ตายจริงที่ 2113 วินาที
+          #   แปลว่า SDK ชั้นในกิน 700 ไปครบสามรอบ แล้ว step หมดเวลาก่อน
+          #   tenacity จะได้ลอง attempt ที่สองด้วยซ้ำ
+          #
+          # ⚠️ เวอร์ชันก่อนของ guard นี้ใช้ × 2 ซึ่งผิด — นับแต่ชั้นนอก ลืมชั้นใน
           BUDGET=$(( REVIEW_MIN * 60 ))
-          if [ $(( AI_TIMEOUT * 2 )) -ge "$BUDGET" ]; then
+
+          # ขั้นที่ 1 (บล็อก): แม้แต่ attempt เดียวของ tenacity ก็ยังไม่จบ
+          if [ $(( AI_TIMEOUT * 3 )) -ge "$BUDGET" ]; then
             echo "::error::ai_timeout=$AI_TIMEOUT ใหญ่เกินไปเทียบกับ review_timeout_minutes=$REVIEW_MIN"
-            echo "pr-agent ซ้อน retry สองชั้น (tenacity 2 × OpenAI SDK 3) request แรกที่ค้าง"
-            echo "จะกิน ai_timeout เต็มก่อน retry ถ้า ai_timeout×2 >= เพดานของ step"
-            echo "retry จะไม่มีทางทำงานจบ และคุณจะเห็นแค่ 'The action Review has timed out'"
+            echo "SDK ชั้นในลอง 3 ครั้งต่อ attempt ดังนั้น attempt เดียวกินได้ถึง 3 × ai_timeout"
+            echo "= $(( AI_TIMEOUT * 3 )) วินาที ซึ่งเกินเพดาน step ($BUDGET วินาที)"
+            echo "คุณจะเห็นแค่ 'The action Review has timed out' ไม่เคยเห็น error จริงจาก provider"
             echo "แก้อย่างใดอย่างหนึ่ง:"
-            echo "  ai_timeout <= $(( BUDGET / 2 - 1 ))  (คงเพดาน step ไว้เท่าเดิม)"
-            echo "  review_timeout_minutes >= $(( (AI_TIMEOUT * 2) / 60 + 1 ))  (คง ai_timeout ไว้เท่าเดิม)"
+            echo "  ai_timeout <= $(( BUDGET / 3 - 1 ))"
+            echo "  review_timeout_minutes >= $(( (AI_TIMEOUT * 3) / 60 + 1 ))"
             exit 1
+          fi
+
+          # ขั้นที่ 2 (เตือน): attempt แรกจบได้ แต่ retry ชั้นนอกยังไม่จบ
+          # ยอมให้ผ่าน เพราะบาง repo อาจรับได้ แต่ต้องรู้ว่าจะไม่เห็น error จริง
+          if [ $(( AI_TIMEOUT * 6 )) -ge "$BUDGET" ]; then
+            echo "::warning::ai_timeout × 6 = $(( AI_TIMEOUT * 6 ))s เกินเพดาน step ($BUDGET s)"
+            echo "ถ้า provider ค้าง step จะถูกตัดก่อน pr-agent จะรายงาน error ของตัวเอง"
+            echo "ถ้าอยากเห็นสาเหตุจริง ตั้ง ai_timeout <= $(( BUDGET / 6 - 1 ))"
           fi
 
           BARE_MODEL="${MODEL#dashscope/}"   # endpoint ดิบรับชื่อ model ล้วน ไม่เอา prefix
